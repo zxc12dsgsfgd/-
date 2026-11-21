@@ -1,0 +1,30 @@
+[project]
+name = "zhiyan-yunshu"
+version = "0.1.0"
+description = "科研知识管理平台"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "alembic>=1.15,<2",
+    "argon2-cffi>=23,<26",
+    "bibtexparser>=1.4,<2",
+    "cryptography>=44,<47",
+    "email-validator>=2,<3",
+    "fastapi>=0.115,<1",
+    "httpx>=0.28,<1",
+    "pydantic-settings>=2.8,<3",
+    "pymysql>=1.1,<2",
+    "python-multipart>=0.0.20,<1",
+    "sqlalchemy>=2.0,<3",
+    "uvicorn[standard]>=0.34,<1",
+]
+
+[dependency-groups]
+dev = ["httpx>=0.28,<1", "pytest>=8,<10"]
+
+[tool.pytest.ini_options]
+pythonpath = ["backend"]
+testpaths = ["backend/tests"]
+
+[[tool.uv.index]]
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+default = true

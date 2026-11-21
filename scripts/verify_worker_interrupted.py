@@ -1,0 +1,129 @@
+"""Interrupt a real worker during an uncommitted notification insert."""
+import os
+import secrets
+import subprocess
+import sys
+import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+from sqlalchemy import create_engine, func, select
+from sqlalchemy.engine import make_url
+from sqlalchemy.orm import Session
+
+from app.config import get_settings
+from app.models import Notification, Paper, User, Workflow, WorkflowEvent, WorkflowRun
+
+root = Path.cwd()
+name = "zhiyan_test_crash_" + secrets.token_hex(6)
+base = make_url(get_settings().database_url)
+user = base.username.replace("'", "''")
+created = granted = False
+engine = None
+process = None
+flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+
+
+def mysql(sql):
+    result = subprocess.run(
+        ["docker", "compose", "exec", "-T", "mysql", "sh", "-c",
+         'MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mysql -u root -N -B'],
+        input=sql.encode(), capture_output=True, timeout=20,
+    )
+    if result.returncode:
+        raise RuntimeError("Temporary database operation failed")
+    return result.stdout.decode().strip()
+
+
+def start(env):
+    return subprocess.Popen([sys.executable, "-m", "app.worker"], cwd=root, env=env,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=flags)
+
+
+def stop(worker):
+    if worker and worker.poll() is None:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/PID", str(worker.pid), "/T", "/F"], capture_output=True, timeout=15)
+        else:
+            worker.kill()
+        worker.wait(timeout=10)
+
+
+def counts():
+    with Session(engine) as db:
+        return tuple(db.scalar(select(func.count()).select_from(model))
+                     for model in (WorkflowEvent, WorkflowRun, Notification))
+
+
+try:
+    mysql(f"CREATE DATABASE `{name}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;")
+    created = True
+    mysql(f"GRANT ALL PRIVILEGES ON `{name}`.* TO '{user}'@'%';")
+    granted = True
+    env = os.environ.copy()
+    env["DATABASE_URL"] = base.set(database=name).render_as_string(hide_password=False)
+    env["PYTHONPATH"] = str(root / "backend")
+    result = subprocess.run([sys.executable, "-m", "alembic", "upgrade", "head"],
+                            env=env, capture_output=True, timeout=40)
+    if result.returncode:
+        raise RuntimeError("Migration failed")
+    engine = create_engine(base.set(database=name))
+    with Session(engine) as db:
+        account = User(email="crash-fixture@example.org", email_norm="crash-fixture@example.org",
+                       password_hash="synthetic", display_name="fixture")
+        db.add(account)
+        db.flush()
+        db.add(Workflow(owner_id=account.id, name="crash", enabled=True, trigger="scheduled_check",
+                        filter_value="1", message="synthetic reminder", action_type="notify"))
+        db.add(Paper(owner_id=account.id, title="overdue", authors=[], status="unread",
+                     created_at=datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=3)))
+        db.commit()
+
+    # A test-only trigger holds the insert open after earlier writes in the transaction.
+    mysql(f"CREATE TRIGGER `{name}`.`pause_notification` BEFORE INSERT ON `{name}`.`notifications` FOR EACH ROW DO SLEEP(30);")
+    process = start(env)
+    deadline = time.monotonic() + 25
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            raise RuntimeError("Worker exited before the insert was observed")
+        in_insert = mysql(
+            "SELECT COUNT(*) FROM information_schema.PROCESSLIST "
+            f"WHERE DB='{name}' AND (INFO LIKE 'INSERT INTO notifications%' OR INFO LIKE 'DO SLEEP(%');"
+        )
+        if int(in_insert or "0"):
+            break
+        time.sleep(.25)
+    else:
+        raise RuntimeError("Did not observe the worker during notification insertion")
+    stop(process)
+    process = None
+    mysql(f"DROP TRIGGER `{name}`.`pause_notification`;")
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and counts() != (0, 0, 0):
+        time.sleep(.2)
+    assert counts() == (0, 0, 0), counts()
+
+    process = start(env)
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            raise RuntimeError("Restarted worker exited unexpectedly")
+        if counts() == (1, 1, 1):
+            break
+        time.sleep(.25)
+    else:
+        raise RuntimeError(f"Worker did not recover: {counts()}")
+    time.sleep(2)
+    assert counts() == (1, 1, 1), counts()
+    print("PASS: forced worker termination during notification insertion rolled back and restart processed exactly once")
+finally:
+    stop(process)
+    if engine:
+        engine.dispose()
+    if granted:
+        mysql(f"REVOKE ALL PRIVILEGES ON `{name}`.* FROM '{user}'@'%';")
+    if created:
+        mysql(f"DROP DATABASE `{name}`;")
+        assert not mysql(f"SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME='{name}';").strip()
+        assert name not in mysql(f"SHOW GRANTS FOR '{user}'@'%';")
+        print("Temporary schema, grant and worker cleaned")
